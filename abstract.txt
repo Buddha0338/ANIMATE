@@ -1,0 +1,10 @@
+To create a program to see if it can identify species from camera traps of image data.
+
+To eliminate the lengthy process of manually identifying species from camera trap data or image data
+
+Can we use the machine learning to identify species that are obscured or behind partial cover
+
+METHODS
+data captured
+using the script, we train the model to understand the images we selected
+processed images are then filtered
