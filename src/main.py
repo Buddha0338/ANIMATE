@@ -5,7 +5,9 @@ from model import predict_species
 from my_utils import (
     display_results, save_result, correct_prediction,
     save_corrected_data, save_filtered_result,
-    preprocess_and_predict, parse_timestamp, group_images_by_time, process_image_group, handle_user_confirmation, ensure_directory_exists
+    preprocess_and_predict, parse_timestamp, group_images_by_time,
+    process_image_group, handle_user_confirmation, ensure_directory_exists,
+    adjust_confidence_based_on_group
 )
 
 def process_images_from_directory(directory, filter_species=None):
@@ -22,10 +24,13 @@ def process_images_from_directory(directory, filter_species=None):
             predictions = preprocess_and_predict(image_path)
             display_results(predictions)
             
-            top_prediction = predictions[0]
+            # Adjust confidence based on the group
+            adjusted_predictions = adjust_confidence_based_on_group(predictions, species_detected)
+            top_prediction = adjusted_predictions[0]
             confidence = top_prediction[2]
+            
             if confidence >= 0.34:
-                category_dir = save_result(image_path, predictions)
+                category_dir = save_result(image_path, adjusted_predictions)
                 if category_dir:
                     os.makedirs(category_dir, exist_ok=True)
                     destination_path = os.path.join(category_dir, os.path.basename(image_path))
@@ -33,7 +38,7 @@ def process_images_from_directory(directory, filter_species=None):
                     if not os.path.exists(destination_path):
                         shutil.move(image_path, destination_path)
             else:
-                correct_label = handle_user_confirmation(image_path, predictions)
+                correct_label = handle_user_confirmation(image_path, adjusted_predictions)
                 print(f"User corrected label: {correct_label}")
                 correct_prediction(image_path, correct_label)
                 save_corrected_data(image_path, correct_label)
