@@ -251,3 +251,14 @@ def handle_user_confirmation(image_path, predictions):
                     print(f"Top prediction confirmed as Elephant for {image_path}")
                     return 'Elephant'
                 return top_prediction[1]
+
+def adjust_confidence_based_on_group(predictions, species_detected):
+    adjusted_predictions = []
+    for prediction in predictions:
+        label = prediction[1]
+        confidence = prediction[2]
+        if label in species_detected and confidence < 0.34:
+            confidence *= 2  # Adjust confidence, for example, double it
+        adjusted_predictions.append((prediction[0], label, confidence))
+    adjusted_predictions.sort(key=lambda x: x[2], reverse=True)  # Sort by confidence
+    return adjusted_predictions
