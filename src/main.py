@@ -1,114 +1,167 @@
+main.py
+
 import os
 import shutil
 import time
 import pickle
 import cv2
-import tensorflow as tf
 from image_processing import preprocess_image, process_video
-from model import predict_species, retrain_model
+from my_utils import species_mapping
+from model import predict_species
 from my_utils import (
-    display_results, ensure_directory_exists, preprocess_and_predict
+    display_results, save_result, correct_prediction,
+    save_corrected_data, save_filtered_result,
+    preprocess_and_predict, parse_timestamp, group_images_by_time,
+    process_image_group, handle_user_confirmation, ensure_directory_exists,
+    adjust_confidence_for_time_group, load_reference_histograms, classify_image_based_on_histogram
 )
 
-# File paths
-CAPUCHIN_MODEL_PATH = "C:/Users/buddh/Desktop/VS Code/ANIMATE/src/capuchin_model.h5"
-CAPUCHIN_SOURCE_DIR = "D:/MIKAELA/Photos and videos/Camera traps brazil"
-CAPUCHIN_TARGET_DIR = "D:/MIKAELA/Photos and videos/Animate testing"
-CAPUCHIN_LOG_FILE = "D:/MIKAELA/Photos and videos/Animate testing/capuchin_detected_images.txt"
-CAPUCHIN_TRAIN_DIR = "D:/MIKAELA/Photos and videos/Animate training"
+# Load the elephant histograms from the reference file
+with open('C:/Users/buddh/Desktop/VS Code/ANIMATE/src/reference_histograms.pkl', 'rb') as f:
+    histograms = pickle.load(f)
 
-# Detection settings
-CAPUCHIN_CONFIDENCE_THRESHOLD = 0.15  # Set to 15%
+# Elephant day and night histograms
+elephant_histogram_day = histograms['elephant_day']
+elephant_histogram_night = histograms['elephant_night']
 
-# Supported image formats
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff"}
+# Function to compare histograms and return a match score
+def compare_histograms(image_histogram, reference_histogram):
+    score = cv2.compareHist(image_histogram, reference_histogram, cv2.HISTCMP_CORREL)
+    return score
 
-# Load the trained capuchin model if available
-capuchin_model = None
-if os.path.exists(CAPUCHIN_MODEL_PATH):
-    capuchin_model = tf.keras.models.load_model(CAPUCHIN_MODEL_PATH)
-else:
-    print(f"Warning: Capuchin model not found at {CAPUCHIN_MODEL_PATH}. Run `--retrain` first.")
+def calculate_histogram(image):
+    """ Calculate the histogram for the given image, ensuring it has 3 channels """
+    if image is None:
+        raise ValueError("Image is None and cannot be processed.")
+    if len(image.shape) == 2:
+        # Image is grayscale, convert to 3-channel BGR
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    elif len(image.shape) == 3 and image.shape[2] != 3:
+        raise ValueError("Image must have 3 channels (RGB or BGR) for histogram calculation.")
+    
+    histogram = cv2.calcHist([image], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+    cv2.normalize(histogram, histogram)
+    return histogram.flatten()
 
-def find_images_recursively(root_dir):
-    """Recursively finds all images in the given directory and subdirectories."""
-    image_paths = []
-    for dirpath, _, filenames in os.walk(root_dir):
-        for filename in filenames:
-            if any(filename.lower().endswith(ext) for ext in IMAGE_EXTENSIONS):
-                image_paths.append(os.path.join(dirpath, filename))
-    return image_paths
+def process_images_from_directory(directory, filter_species=None):
+    # Load reference histograms
+    reference_histograms = load_reference_histograms()
 
-def process_capuchin_images(root_directory):
-    """Process images, detect capuchins, and copy detected files."""
-    ensure_directory_exists(CAPUCHIN_TARGET_DIR)
-    detected_images = []
+    # Group images by time (120-second window for adjusting confidence)
+    image_paths = [os.path.join(directory, f) for f in os.listdir(directory) if f.lower().endswith((".jpg", ".png"))]
+    grouped_images = group_images_by_time(image_paths, time_window=2)  # 120-second group
 
-    if capuchin_model is None:
-        print("Error: Capuchin model not loaded. Please run `--retrain` first.")
-        return
+    for image_group in grouped_images:
+        print(f"Processing image group: {image_group}")
+        species_detected = process_image_group(image_group)
 
-    # Find all images recursively
-    image_paths = find_images_recursively(root_directory)
-    print(f"Found {len(image_paths)} images. Checking for capuchins...")
+        for image_path in image_group:
+            try:
+                start_time = time.time()
+                
+                # Load and preprocess the image
+                image = cv2.imread(image_path, cv2.IMREAD_COLOR)
+                if image is None or len(image.shape) != 3 or image.shape[2] != 3:
+                    print(f"Error: Image at {image_path} has an unexpected shape: {image.shape if image is not None else 'None'}")
+                    raise ValueError("Image must have 3 channels (RGB or BGR) for histogram calculation.")
+                
+                # Preprocess the image
+                processed_image = preprocess_image(image_path)
+                
+                predictions = preprocess_and_predict(image_path)
 
-    for image_path in image_paths:
-        try:
-            # Load and preprocess image
-            image = cv2.imread(image_path, cv2.IMREAD_COLOR)
-            if image is None:
-                print(f"Skipping unreadable image: {image_path}")
-                continue
+                # Calculate histogram for the current image
+                image_histogram = calculate_histogram(image)
 
-            # Run model prediction
-            predictions = preprocess_and_predict(image_path)
-            if not predictions:
-                print(f"No predictions found for {image_path}. Skipping.")
-                continue
+                # Compare with elephant histograms (day and night)
+                score_day = compare_histograms(image_histogram, elephant_histogram_day)
+                score_night = compare_histograms(image_histogram, elephant_histogram_night)
 
-            # Check for capuchin with confidence ≥ threshold
-            for _, label, confidence in predictions:
-                if "capuchin" in label.lower() and confidence >= CAPUCHIN_CONFIDENCE_THRESHOLD:
-                    print(f"Capuchin detected in {image_path} with confidence {confidence:.2f}")
+                # Adjust confidence if the histogram matches the elephant histograms
+                histogram_match_threshold = 0.8  # Adjust this threshold as needed
+                if score_day >= histogram_match_threshold or score_night >= histogram_match_threshold:
+                    print(f"Histogram match for elephant detected in {image_path}")
+                    for i, prediction in enumerate(predictions):
+                        if len(prediction) == 3:  # Check if the prediction has three elements
+                            label, confidence = prediction[1], prediction[2]
+                            if 'elephant' in label.lower() or 'tusker' in label.lower():
+                                predictions[i] = (prediction[0], label, confidence * 1.5)  # Boost confidence by 50%
+                        else:
+                            print(f"Unexpected prediction format: {prediction}")
+                            continue
 
-                    # Save image path to log
-                    detected_images.append(image_path)
+                # Apply confidence adjustment BEFORE deciding to move to the Elephant folder
+                adjusted_predictions = adjust_confidence_for_time_group(predictions, species_detected)
+                top_prediction = adjusted_predictions[0]
+                confidence = top_prediction[2]
+                label = top_prediction[1].lower()
 
-                    # Copy image to the target directory
-                    destination_path = os.path.join(CAPUCHIN_TARGET_DIR, os.path.basename(image_path))
-                    if not os.path.exists(destination_path):
-                        shutil.copy(image_path, destination_path)
-                    break  # Stop checking other predictions if capuchin is found
-        except Exception as e:
-            print(f"Error processing {image_path}: {e}")
+                display_results(adjusted_predictions)
 
-    # Save detected image paths to a text file
-    with open(CAPUCHIN_LOG_FILE, "w") as f:
-        f.write("\n".join(detected_images))
+                # Check if it's classified as "Elephant" or "Tusker"
+                if 'elephant' in label or 'tusker' in label:
+                    # Check confidence after adjustment
+                    if confidence >= 0.30:  # Updated confidence threshold for elephants and tuskers
+                        # Move image to Elephant folder
+                        category_dir = save_result(image_path, adjusted_predictions)
+                        if category_dir:
+                            os.makedirs(category_dir, exist_ok=True)
+                            destination_path = os.path.join(category_dir, os.path.basename(image_path))
+                            print(f"Moving image to: {destination_path}")
+                            if not os.path.exists(destination_path):
+                                shutil.move(image_path, destination_path)
+                        else:
+                            print(f"Low confidence: {confidence}, moving image to Nondetect")
+                            move_to_nondetect(image_path)
+                    else:
+                        # If confidence is too low, move to Nondetect
+                        print(f"Low confidence: {confidence}, moving image to Nondetect")
+                        move_to_nondetect(image_path)
+                else:
+                    # Automatically move all non-elephant images to Nondetect folder
+                    print(f"Non-elephant detection: {label}, moving image to Nondetect")
+                    move_to_nondetect(image_path)
+            except ValueError as e:
+                print(f"Error processing image {image_path}: {e}")
 
-    print(f"Detection complete. {len(detected_images)} capuchin images copied to '{CAPUCHIN_TARGET_DIR}'.")
-    print(f"File paths saved to '{CAPUCHIN_LOG_FILE}'.")
+def move_to_nondetect(image_path):
+    """ Helper function to move images to the Nondetect folder """
+    category_dir = os.path.join('C:/Users/buddh/Desktop/VS Code/ANIMATE/data/results', 'Nondetect')
+    ensure_directory_exists(category_dir)
+    destination_path = os.path.join(category_dir, os.path.basename(image_path))
+    print(f"Moving image to Nondetect: {destination_path}")
+    if not os.path.exists(destination_path):
+        shutil.move(image_path, destination_path)
+
+def process_videos_from_directory(directory):
+    for filename in os.listdir(directory):
+        if filename.lower().endswith((".mp4", ".avi")):  # Make extension check case-insensitive
+            video_path = os.path.join(directory, filename)
+            print(f"Processing {video_path}")
+            process_video(video_path)
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Analyze images or videos.")
-    parser.add_argument("--type", type=str, choices=["images", "videos"], help="Analyze 'images' or 'videos'")
-    parser.add_argument("--capuchin", action="store_true", help="Run capuchin detection mode")
-    parser.add_argument("--retrain", action="store_true", help="Retrain the capuchin model")
+    parser.add_argument("--type", type=str, choices=["images", "videos"], required=True, help="Type of files to analyze: 'images' or 'videos'")
+    parser.add_argument("--retrain", action='store_true', help="Retrain the model with corrected data")
+    parser.add_argument("--fetch", action='store_true', help="Fetch data from GBIF")
+    parser.add_argument("--filter", type=str, help="Filter species, e.g., 'elephant'")
+    parser.add_argument("--local-only", action='store_true', help="Run program without using Azure API (local predictions only)")
     args = parser.parse_args()
 
-    if args.retrain:
-        retrain_model(CAPUCHIN_TRAIN_DIR, CAPUCHIN_MODEL_PATH)
-
-    if args.capuchin:
-        print("Scanning for Capuchins in the flash drive...")
-        process_capuchin_images(CAPUCHIN_SOURCE_DIR)
+    if args.fetch:
+        # Remove GBIF related code
+        pass
 
     if args.type:
         if args.type == "images":
-            image_directory = "C:/Users/buddh/Desktop/VS Code/ANIMATE/data/images"
-            process_images_from_directory(image_directory)
+            image_directory = "data/images"
+            process_images_from_directory(image_directory, args.filter)
         elif args.type == "videos":
-            video_directory = "C:/Users/buddh/Desktop/VS Code/ANIMATE/data/videos"
+            video_directory = "data/videos"
             process_videos_from_directory(video_directory)
+
+    if args.retrain:
+        retrain_model()
